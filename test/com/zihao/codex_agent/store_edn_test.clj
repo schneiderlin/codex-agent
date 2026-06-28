@@ -43,6 +43,36 @@
         (is (= "remote-thread-1"
                (get-in root [:sessions key :codex-thread-id])))))))
 
+(deftest promote-session-moves-session-and-keeps-alias-test
+  (testing "bootstrap sessions can be promoted to a durable external session id"
+    (let [path (temp-store-path)
+          store (sut/open! {:path path})
+          bootstrap-key [:feishu "bootstrap:om_1"]
+          thread-key [:feishu "omt_1"]]
+      (sut/update-session!
+       store
+       bootstrap-key
+       (fn [_]
+         (-> (session/new-session {:channel :feishu
+                                   :external-session-id "bootstrap:om_1"}
+                                  "t0")
+             (session/set-codex-thread-id "remote-thread-1" "t1"))))
+      (sut/promote-session!
+       store
+       bootstrap-key
+       thread-key
+       #(session/retarget-session % thread-key "t2"))
+      (let [root (edn/read-string (slurp path))]
+        (is (nil? (get-in root [:sessions bootstrap-key])))
+        (is (= "remote-thread-1"
+               (get-in root [:sessions thread-key :codex-thread-id])))
+        (is (= "omt_1"
+               (get-in root [:sessions thread-key :external-session-id])))
+        (is (= thread-key
+               (get-in root [:aliases bootstrap-key])))
+        (is (= (get-in root [:sessions thread-key])
+               (sut/get-session store bootstrap-key)))))))
+
 (deftest remember-message-id-bounds-processed-cache-test
   (testing "processed-message-ids is an idempotency cache, not an audit log"
     (let [session (reduce (fn [s id]

@@ -71,10 +71,15 @@
 (defn- run-reply-callback!
   [callbacks reply]
   (if-let [f (:on-reply! callbacks)]
-    (do
-      (f reply)
-      :delivered)
-    :not-configured))
+    {:status :delivered
+     :result (f reply)}
+    {:status :not-configured}))
+
+(defn- promotion-external-session-id
+  [delivery]
+  (let [result (:result delivery)]
+    (or (:promote-external-session-id result)
+        (:codex-agent/promote-external-session-id result))))
 
 (defn- app-session-key
   [[channel external-session-id]]
@@ -124,6 +129,19 @@
            (session/mark-status :idle now)
            (session/set-delivery-status delivery-status now))))))
 
+(defn promote-session!
+  [^Service service {:keys [channel from-external-session-id to-external-session-id]}]
+  (let [from-key (session/session-key {:channel channel
+                                       :external-session-id from-external-session-id})
+        to-key (session/session-key {:channel channel
+                                     :external-session-id to-external-session-id})
+        now (session/now-iso)]
+    (store-edn/promote-session!
+     (:store service)
+     from-key
+     to-key
+     #(session/retarget-session % to-key now))))
+
 (defn handle-message!
   [^Service service message callbacks]
   (let [key (session/session-key message)
@@ -169,21 +187,39 @@
                                                  session-before
                                                  codex-thread-id
                                                  :pending)
-                      delivery-status (try
-                                        (run-reply-callback! callbacks
-                                                             (delivery-reply reply-text result))
-                                        (catch Throwable t
-                                          (safe-event! callbacks
-                                                       {:type :codex-agent/reply-callback-failed
-                                                        :throwable t})
-                                          :failed))]
+                      delivery (try
+                                 (run-reply-callback! callbacks
+                                                      (delivery-reply reply-text result))
+                                 (catch Throwable t
+                                   (safe-event! callbacks
+                                                {:type :codex-agent/reply-callback-failed
+                                                 :throwable t})
+                                   {:status :failed}))
+                      promote-to (promotion-external-session-id delivery)
+                      promoted? (and promote-to
+                                     (not= (str promote-to)
+                                           (str (:external-session-id message))))
+                      final-key (if promoted?
+                                  (do
+                                    (promote-session! service
+                                                      {:channel (:channel message)
+                                                       :from-external-session-id (:external-session-id message)
+                                                       :to-external-session-id promote-to})
+                                    (session/session-key {:channel (:channel message)
+                                                          :external-session-id promote-to}))
+                                  key)
+                      final-result (cond-> result
+                                     promoted?
+                                     (assoc :external-session-id (str promote-to)
+                                            :previous-external-session-id (str (:external-session-id message))
+                                            :promoted? true))]
                   (persist-completed-turn! service
-                                           key
-                                           message
+                                           final-key
+                                           (assoc message :external-session-id (second final-key))
                                            session-before
                                            codex-thread-id
-                                           delivery-status)
-                  (assoc result :delivery-status delivery-status))
+                                           (:status delivery))
+                  (assoc final-result :delivery-status (:status delivery)))
                 (let [result (assoc (result-base message codex-thread-id)
                                     :status status
                                     :reply-text (or reply-text "")

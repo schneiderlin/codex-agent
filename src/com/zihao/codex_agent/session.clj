@@ -32,6 +32,13 @@
    :last-delivery-status nil
    :processed-message-ids []})
 
+(defn retarget-session
+  [session [channel external-session-id] now]
+  (assoc session
+         :channel channel
+         :external-session-id (str external-session-id)
+         :updated-at now))
+
 (defn processed-message?
   [session external-message-id]
   (and (some? external-message-id)

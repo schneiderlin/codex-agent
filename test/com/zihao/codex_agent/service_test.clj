@@ -108,6 +108,70 @@
           (is (= :failed
                  (get-in root [:sessions [:feishu "chat-1"] :last-delivery-status]))))))))
 
+(deftest reply-callback-can-promote-bootstrap-session
+  (testing "reply delivery can promote a bootstrap key to the channel thread id"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          bootstrap-message {:channel :feishu
+                             :external-session-id "bootstrap:om_1"
+                             :external-message-id "om_1"
+                             :content [{:type :text :text "hello"}]}]
+      (with-redefs [app-server/run-turn!
+                    (fn [_ request]
+                      ((get-in request [:callbacks :on-thread-started])
+                       {:codex-thread-id "remote-thread-1"})
+                      {:status :completed
+                       :codex-thread-id "remote-thread-1"
+                       :text "reply"})]
+        (let [result (codex-agent/handle-message!
+                      service
+                      bootstrap-message
+                      {:on-reply! (fn [_]
+                                    {:promote-external-session-id "omt_1"})})
+              root (edn/read-string (slurp path))
+              bootstrap-key [:feishu "bootstrap:om_1"]
+              thread-key [:feishu "omt_1"]]
+          (is (= :completed (:status result)))
+          (is (= true (:promoted? result)))
+          (is (= "omt_1" (:external-session-id result)))
+          (is (= "bootstrap:om_1" (:previous-external-session-id result)))
+          (is (nil? (get-in root [:sessions bootstrap-key])))
+          (is (= thread-key (get-in root [:aliases bootstrap-key])))
+          (is (= "remote-thread-1"
+                 (get-in root [:sessions thread-key :codex-thread-id])))
+          (is (= ["om_1"]
+                 (get-in root [:sessions thread-key :processed-message-ids])))
+          (is (= :delivered
+                 (get-in root [:sessions thread-key :last-delivery-status]))))))))
+
+(deftest promoted-bootstrap-duplicate-resolves-through-alias
+  (testing "a retried top-level message does not start another turn after promotion"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          calls (atom 0)
+          bootstrap-message {:channel :feishu
+                             :external-session-id "bootstrap:om_1"
+                             :external-message-id "om_1"
+                             :content [{:type :text :text "hello"}]}]
+      (with-redefs [app-server/run-turn!
+                    (fn [_ request]
+                      (swap! calls inc)
+                      ((get-in request [:callbacks :on-thread-started])
+                       {:codex-thread-id "remote-thread-1"})
+                      {:status :completed
+                       :codex-thread-id "remote-thread-1"
+                       :text "reply"})]
+        (codex-agent/handle-message!
+         service
+         bootstrap-message
+         {:on-reply! (fn [_] {:promote-external-session-id "omt_1"})})
+        (let [duplicate (codex-agent/handle-message! service bootstrap-message {})]
+          (is (= :duplicate (:status duplicate)))
+          (is (= "remote-thread-1" (:codex-thread-id duplicate)))
+          (is (= 1 @calls)))))))
+
 (deftest busy-session-returns-structured-result
   (testing "a second distinct message while a turn is active does not start another turn"
     (let [path (temp-store-path)
