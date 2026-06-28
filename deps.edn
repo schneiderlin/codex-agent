@@ -1,4 +1,5 @@
 {:paths ["src"]
- :deps {poly/codex-app-server {:local/root "../codex-app-server"}}
+ :deps {poly/codex-app-server {:git/url "https://github.com/schneiderlin/codex-app-server.git"
+                                :git/sha "56fc01f3df958125a275251c1f505f225cea3aee"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {}}}}
