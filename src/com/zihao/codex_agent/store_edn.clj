@@ -2,7 +2,7 @@
   "EDN-backed Codex Agent session store."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io])
-  (:import [java.nio.file AtomicMoveNotSupportedException Files StandardCopyOption]))
+  (:import [java.nio.file Files StandardCopyOption]))
 
 (def store-version 1)
 
@@ -73,11 +73,14 @@
                     (into-array StandardCopyOption
                                 [StandardCopyOption/ATOMIC_MOVE
                                  StandardCopyOption/REPLACE_EXISTING]))
-        (catch AtomicMoveNotSupportedException _
-          (Files/move tmp-path
-                      (.toPath f)
-                      (into-array StandardCopyOption
-                                  [StandardCopyOption/REPLACE_EXISTING]))))
+        (catch Exception e
+          (if (= "java.nio.file.AtomicMoveNotSupportedException"
+                 (.getName (class e)))
+            (Files/move tmp-path
+                        (.toPath f)
+                        (into-array StandardCopyOption
+                                    [StandardCopyOption/REPLACE_EXISTING]))
+            (throw e))))
       root
       (finally
         (try
