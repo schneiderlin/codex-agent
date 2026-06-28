@@ -1,0 +1,4 @@
+{:paths ["src"]
+ :deps {poly/codex-app-server {:local/root "../codex-app-server"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {}}}}
