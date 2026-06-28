@@ -198,3 +198,46 @@
             (is (= 1 @calls)))
           (deliver release true)
           @f)))))
+
+(deftest app-server-command-callbacks-are-forwarded-as-events
+  (testing "Codex app-server item and command callbacks are exposed through Codex Agent events"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          events (atom [])]
+      (with-redefs [app-server/run-turn!
+                    (fn [_ request]
+                      (let [callbacks (:callbacks request)]
+                        ((:on-item-started callbacks)
+                         {:item-type "commandExecution"
+                          :item-id "cmd-1"
+                          :command "ls"})
+                        ((:on-command-delta callbacks) "apps\n")
+                        ((:on-item-completed callbacks)
+                         {:item-type "commandExecution"
+                          :item-id "cmd-1"
+                          :status "completed"
+                          :command "ls"
+                          :exit-code 0
+                          :output "apps\nbases\n"}))
+                      {:status :completed
+                       :codex-thread-id "remote-thread-1"
+                       :text "done"})]
+        (codex-agent/handle-message!
+         service
+         (message "m1" "try use ls")
+         {:on-event! #(swap! events conj %)})
+        (is (= [{:type :codex/item-started
+                 :item-type "commandExecution"
+                 :item-id "cmd-1"
+                 :command "ls"}
+                {:type :codex/command-delta
+                 :delta "apps\n"}
+                {:type :codex/item-completed
+                 :item-type "commandExecution"
+                 :item-id "cmd-1"
+                 :status "completed"
+                 :command "ls"
+                 :exit-code 0
+                 :output "apps\nbases\n"}]
+               @events))))))

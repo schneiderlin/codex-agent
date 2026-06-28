@@ -63,6 +63,10 @@
       (f event)
       (catch Throwable _))))
 
+(defn- emit-codex-event!
+  [callbacks type data]
+  (safe-event! callbacks (assoc data :type type)))
+
 (defn- delivery-reply
   [reply-text result]
   {:text (or reply-text "")
@@ -109,6 +113,19 @@
    :on-event
    (fn [event]
      (safe-event! callbacks event))
+
+   :on-item-started
+   (fn [item]
+     (emit-codex-event! callbacks :codex/item-started item))
+
+   :on-item-completed
+   (fn [item]
+     (emit-codex-event! callbacks :codex/item-completed item))
+
+   :on-command-delta
+   (fn [delta]
+     (safe-event! callbacks {:type :codex/command-delta
+                             :delta delta}))
 
    :on-dynamic-tool-call
    (:on-dynamic-tool-call! callbacks)})
