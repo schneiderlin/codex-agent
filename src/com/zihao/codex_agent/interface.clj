@@ -16,3 +16,7 @@
 (defn promote-session!
   [svc request]
   (service/promote-session! svc request))
+
+(defn stop-session!
+  [svc message]
+  (service/stop-session! svc message))

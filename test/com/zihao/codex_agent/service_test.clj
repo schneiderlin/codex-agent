@@ -241,3 +241,91 @@
                  :exit-code 0
                  :output "apps\nbases\n"}]
                @events))))))
+
+(deftest app-server-dynamic-tool-options-are-forwarded
+  (testing "Codex Agent can expose per-channel dynamic tools to app-server"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          requests (atom [])
+          tool-spec {:name "send_feishu_file"
+                     :description "Send a local file back to Feishu."
+                     :input-schema {:type "object"}}]
+      (with-redefs [app-server/run-turn!
+                    (fn [_ request]
+                      (swap! requests conj request)
+                      {:status :completed
+                       :codex-thread-id "remote-thread-1"
+                       :text "done"})]
+        (codex-agent/handle-message!
+         service
+         (message "m1" "send file")
+         {:dynamic-tools [tool-spec]
+          :experimental-api? true
+          :on-dynamic-tool-call! (fn [_] "ok")})
+        (is (= [tool-spec] (:dynamic-tools (first @requests))))
+        (is (= true (:experimental-api? (first @requests))))
+        (is (fn? (get-in (first @requests) [:callbacks :on-dynamic-tool-call])))))))
+
+(deftest stop-session-interrupts-current-app-server-turn
+  (testing "stop-session targets the app-server session key without entering normal message handling"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          interrupt-requests (atom [])]
+      (with-redefs [app-server/run-turn!
+                    (fn [_ request]
+                      ((get-in request [:callbacks :on-thread-started])
+                       {:codex-thread-id "remote-thread-1"})
+                      {:status :completed
+                       :codex-thread-id "remote-thread-1"
+                       :text "ready"})
+                    app-server/interrupt-turn!
+                    (fn [_ request]
+                      (swap! interrupt-requests conj request)
+                      {:interrupted? true
+                       :codex-thread-id "remote-thread-1"
+                       :codex-turn-id "turn-1"})]
+        (codex-agent/handle-message! service (message "m1" "hello") {})
+        (is (= {:channel :feishu
+                :external-session-id "chat-1"
+                :codex-thread-id "remote-thread-1"
+                :status :interrupted
+                :interrupted? true
+                :codex-turn-id "turn-1"}
+               (codex-agent/stop-session! service (message "m2" "/stop"))))
+        (is (= [{:session-key "feishu:chat-1"}]
+               @interrupt-requests))))))
+
+(deftest stop-session-resolves-promoted-bootstrap-alias
+  (testing "a stop request for the original bootstrap key interrupts the promoted thread session"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          interrupt-requests (atom [])
+          bootstrap-message {:channel :feishu
+                             :external-session-id "bootstrap:om_1"
+                             :external-message-id "om_1"
+                             :content [{:type :text :text "hello"}]}]
+      (with-redefs [app-server/run-turn!
+                    (fn [_ request]
+                      ((get-in request [:callbacks :on-thread-started])
+                       {:codex-thread-id "remote-thread-1"})
+                      {:status :completed
+                       :codex-thread-id "remote-thread-1"
+                       :text "ready"})
+                    app-server/interrupt-turn!
+                    (fn [_ request]
+                      (swap! interrupt-requests conj request)
+                      {:interrupted? true
+                       :codex-thread-id "remote-thread-1"
+                       :codex-turn-id "turn-1"})]
+        (codex-agent/handle-message!
+         service
+         bootstrap-message
+         {:on-reply! (fn [_] {:promote-external-session-id "omt_1"})})
+        (is (= "omt_1"
+               (:external-session-id
+                (codex-agent/stop-session! service bootstrap-message))))
+        (is (= [{:session-key "feishu:omt_1"}]
+               @interrupt-requests))))))

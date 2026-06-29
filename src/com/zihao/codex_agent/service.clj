@@ -130,6 +130,13 @@
    :on-dynamic-tool-call
    (:on-dynamic-tool-call! callbacks)})
 
+(defn- app-server-request-options
+  [service callbacks]
+  (merge (select-keys (:config service)
+                      [:dynamic-tools :experimental-api? :workdir-path])
+         (select-keys callbacks
+                      [:dynamic-tools :experimental-api? :workdir-path])))
+
 (defn- persist-completed-turn!
   [service key message session-before codex-thread-id delivery-status]
   (let [now (session/now-iso)
@@ -159,6 +166,27 @@
      to-key
      #(session/retarget-session % to-key now))))
 
+(defn stop-session!
+  "Interrupt the active Codex turn for a session without taking that session's
+   message lock. This lets an out-of-band control message stop a running turn."
+  [^Service service message]
+  (let [store (:store service)
+        requested-key (session/session-key message)
+        key (store-edn/canonical-session-key store requested-key)
+        stored-session (store-edn/get-session store key)
+        interrupt-result (app-server/interrupt-turn!
+                          (:app-server service)
+                          {:session-key (app-session-key key)})
+        codex-thread-id (or (:codex-thread-id interrupt-result)
+                            (:codex-thread-id stored-session))]
+    (merge
+     (result-base {:channel (first key)
+                   :external-session-id (second key)}
+                  codex-thread-id)
+     {:status (if (:interrupted? interrupt-result) :interrupted :idle)
+      :interrupted? (boolean (:interrupted? interrupt-result))}
+     (select-keys interrupt-result [:reason :error-message :codex-turn-id]))))
+
 (defn handle-message!
   [^Service service message callbacks]
   (let [key (session/session-key message)
@@ -185,10 +213,12 @@
                   input-items (session/content->input-items (:content message))
                   app-result (app-server/run-turn!
                               (:app-server service)
-                              {:session-key (app-session-key key)
-                               :codex-thread-id (:codex-thread-id session-before)
-                               :input-items input-items
-                               :callbacks (callback-request service key callbacks latest-thread-id)})
+                              (merge
+                               (app-server-request-options service callbacks)
+                               {:session-key (app-session-key key)
+                                :codex-thread-id (:codex-thread-id session-before)
+                                :input-items input-items
+                                :callbacks (callback-request service key callbacks latest-thread-id)}))
                   codex-thread-id (or (:codex-thread-id app-result)
                                       @latest-thread-id
                                       (:codex-thread-id session-before))
