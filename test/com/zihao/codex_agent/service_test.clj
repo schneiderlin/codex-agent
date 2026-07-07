@@ -12,11 +12,13 @@
     (.getPath (io/file dir "sessions.edn"))))
 
 (defn- message
-  [message-id text]
-  {:channel :feishu
-   :external-session-id "chat-1"
-   :external-message-id message-id
-   :content [{:type :text :text text}]})
+  ([message-id text]
+   (message "chat-1" message-id text))
+  ([session-id message-id text]
+   {:channel :feishu
+    :external-session-id session-id
+    :external-message-id message-id
+    :content [{:type :text :text text}]}))
 
 (deftest handle-message-starts-thread-persists-session-and-replies
   (testing "first external message creates a Codex thread and persists before reply callback"
@@ -198,6 +200,146 @@
             (is (= 1 @calls)))
           (deliver release true)
           @f)))))
+
+(deftest submit-message-queues-same-session-turns-in-order
+  (testing "submitted ordinary messages for one external session run FIFO"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          requests (atom [])
+          first-started (promise)
+          release-first (promise)
+          second-finished (promise)]
+      (try
+        (with-redefs [app-server/run-turn!
+                      (fn [_ request]
+                        (let [text (get-in request [:input-items 0 :text])]
+                          (swap! requests conj request)
+                          (case text
+                            "first"
+                            (do
+                              (deliver first-started true)
+                              @release-first)
+
+                            "second"
+                            (deliver second-finished true)
+
+                            nil)
+                          {:status :completed
+                           :codex-thread-id "remote-thread-1"
+                           :text (str "reply " text)}))]
+          (is (= :queued
+                 (:status
+                  (codex-agent/submit-message! service
+                                               (message "m1" "first")
+                                               {}))))
+          (is (= true (deref first-started 1000 nil)))
+          (is (= :queued
+                 (:status
+                  (codex-agent/submit-message! service
+                                               (message "m2" "second")
+                                               {}))))
+          (is (= ["first"]
+                 (mapv #(get-in % [:input-items 0 :text]) @requests)))
+          (deliver release-first true)
+          (is (= true (deref second-finished 1000 nil)))
+          (is (= ["first" "second"]
+                 (mapv #(get-in % [:input-items 0 :text]) @requests)))
+          (is (= "remote-thread-1"
+                 (:codex-thread-id (second @requests)))))
+        (finally
+          (codex-agent/close! service))))))
+
+(deftest submit-message-runs-different-sessions-in-parallel
+  (testing "submitted messages for different external sessions are not globally serialized"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake
+                                       :submit-worker-count 2})
+          chat-1-started (promise)
+          chat-2-started (promise)
+          release (promise)]
+      (try
+        (with-redefs [app-server/run-turn!
+                      (fn [_ request]
+                        (case (:session-key request)
+                          "feishu:chat-1" (deliver chat-1-started true)
+                          "feishu:chat-2" (deliver chat-2-started true)
+                          nil)
+                        @release
+                        {:status :completed
+                         :codex-thread-id (str "remote-" (:session-key request))
+                         :text "done"})]
+          (is (= :queued
+                 (:status
+                  (codex-agent/submit-message! service
+                                               (message "chat-1" "m1" "first")
+                                               {}))))
+          (is (= :queued
+                 (:status
+                  (codex-agent/submit-message! service
+                                               (message "chat-2" "m2" "second")
+                                               {}))))
+          (is (= true (deref chat-1-started 1000 nil)))
+          (is (= true (deref chat-2-started 1000 nil)))
+          (deliver release true))
+        (finally
+          (deliver release true)
+          (codex-agent/close! service))))))
+
+(deftest stop-session-discards-pending-submitted-messages
+  (testing "out-of-band stop interrupts the active turn and clears queued ordinary messages"
+    (let [path (temp-store-path)
+          service (codex-agent/start! {:store-path path
+                                       :codex-app-server-service ::fake})
+          first-started (promise)
+          release-first (promise)
+          first-finished (promise)
+          second-started (promise)
+          interrupt-requests (atom [])]
+      (try
+        (with-redefs [app-server/run-turn!
+                      (fn [_ request]
+                        (let [text (get-in request [:input-items 0 :text])]
+                          (case text
+                            "first"
+                            (do
+                              (deliver first-started true)
+                              @release-first
+                              (deliver first-finished true))
+
+                            "second"
+                            (deliver second-started true)
+
+                            nil)
+                          {:status :completed
+                           :codex-thread-id "remote-thread-1"
+                           :text (str "reply " text)}))
+                      app-server/interrupt-turn!
+                      (fn [_ request]
+                        (swap! interrupt-requests conj request)
+                        {:interrupted? true
+                         :codex-thread-id "remote-thread-1"
+                         :codex-turn-id "turn-1"})]
+          (codex-agent/submit-message! service (message "m1" "first") {})
+          (is (= true (deref first-started 1000 nil)))
+          (codex-agent/submit-message! service (message "m2" "second") {})
+          (is (= {:channel :feishu
+                  :external-session-id "chat-1"
+                  :codex-thread-id "remote-thread-1"
+                  :status :interrupted
+                  :interrupted? true
+                  :codex-turn-id "turn-1"
+                  :discarded-message-count 1}
+                 (codex-agent/stop-session! service (message "m3" "/stop"))))
+          (is (= [{:session-key "feishu:chat-1"}]
+                 @interrupt-requests))
+          (deliver release-first true)
+          (is (= true (deref first-finished 1000 nil)))
+          (is (= ::not-started (deref second-started 100 ::not-started))))
+        (finally
+          (deliver release-first true)
+          (codex-agent/close! service))))))
 
 (deftest app-server-command-callbacks-are-forwarded-as-events
   (testing "Codex app-server item and command callbacks are exposed through Codex Agent events"

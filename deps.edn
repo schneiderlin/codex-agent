@@ -1,5 +1,6 @@
 {:paths ["src"]
  :deps {poly/codex-app-server {:git/url "https://github.com/schneiderlin/codex-app-server.git"
-                                :git/sha "56fc01f3df958125a275251c1f505f225cea3aee"}}
+                                :git/sha "56fc01f3df958125a275251c1f505f225cea3aee"}
+        org.clojure/core.async {:mvn/version "1.8.741"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {}}}}

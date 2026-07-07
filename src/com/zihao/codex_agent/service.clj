@@ -1,10 +1,174 @@
 (ns com.zihao.codex-agent.service
-  (:require [com.zihao.codex-agent.session :as session]
+  (:require [clojure.core.async :as async]
+            [com.zihao.codex-agent.session :as session]
             [com.zihao.codex-agent.store-edn :as store-edn]
             [com.zihao.codex-app-server.interface :as app-server])
   (:import [java.util.concurrent.locks ReentrantLock]))
 
-(defrecord Service [config store app-server owns-app-server? locks*])
+(declare handle-message! safe-event!)
+
+(def default-submit-worker-count 4)
+(def default-submit-close-timeout-ms 1000)
+
+(def ^:private empty-submission-queue clojure.lang.PersistentQueue/EMPTY)
+
+(defrecord SubmissionDispatcher [ready-ch worker-futures !queues !closed?])
+
+(defrecord Service [config store app-server owns-app-server? locks* dispatcher* closed?*])
+
+(defn- message-id-key
+  [message]
+  (when-some [message-id (:external-message-id message)]
+    (str message-id)))
+
+(defn- schedule-session!
+  [dispatcher key]
+  (when-not @(:!closed? dispatcher)
+    (async/put! (:ready-ch dispatcher) key)))
+
+(defn- enqueue-submission!
+  [^SubmissionDispatcher dispatcher key message callbacks]
+  (if @(:!closed? dispatcher)
+    {:status :closed
+     :channel (first key)
+     :external-session-id (second key)}
+    (let [result (atom nil)
+          schedule? (atom false)]
+      (swap!
+       (:!queues dispatcher)
+       (fn [queues]
+         (let [entry (get queues key {:items empty-submission-queue
+                                      :queued-message-ids #{}
+                                      :running? false})
+               message-id (message-id-key message)]
+           (if (and message-id
+                    (contains? (:queued-message-ids entry) message-id))
+             (do
+               (reset! result
+                       {:status :duplicate
+                        :channel (first key)
+                        :external-session-id (second key)})
+               queues)
+             (let [items* (conj (:items entry)
+                                {:message message
+                                 :callbacks callbacks})
+                   entry* (cond-> (assoc entry
+                                          :items items*
+                                          :running? true)
+                            message-id
+                            (update :queued-message-ids conj message-id))]
+               (when-not (:running? entry)
+                 (reset! schedule? true))
+               (reset! result
+                       {:status :queued
+                        :channel (first key)
+                        :external-session-id (second key)
+                        :queue-depth (count items*)})
+               (assoc queues key entry*))))))
+      (when @schedule?
+        (schedule-session! dispatcher key))
+      @result)))
+
+(defn- take-next-submission!
+  [^SubmissionDispatcher dispatcher key]
+  (let [submission (atom nil)]
+    (swap!
+     (:!queues dispatcher)
+     (fn [queues]
+       (let [entry (get queues key)
+             items (:items entry)]
+         (if (seq items)
+           (let [item (peek items)
+                 message-id (message-id-key (:message item))
+                 items* (pop items)
+                 entry* (cond-> (assoc entry :items items*)
+                          message-id
+                          (update :queued-message-ids disj message-id))]
+             (reset! submission item)
+             (assoc queues key entry*))
+           (dissoc queues key)))))
+    @submission))
+
+(defn- complete-submission!
+  [^SubmissionDispatcher dispatcher key]
+  (let [schedule? (atom false)]
+    (swap!
+     (:!queues dispatcher)
+     (fn [queues]
+       (if-let [entry (get queues key)]
+         (if (seq (:items entry))
+           (do
+             (reset! schedule? true)
+             (assoc queues key (assoc entry :running? true)))
+           (dissoc queues key))
+         queues)))
+    (when @schedule?
+      (schedule-session! dispatcher key))))
+
+(defn- discard-pending-submissions!
+  [^SubmissionDispatcher dispatcher key]
+  (let [discarded (atom 0)]
+    (swap!
+     (:!queues dispatcher)
+     (fn [queues]
+       (if-let [entry (get queues key)]
+         (let [n (count (:items entry))]
+           (reset! discarded n)
+           (if (:running? entry)
+             (assoc queues key (assoc entry
+                                      :items empty-submission-queue
+                                      :queued-message-ids #{}))
+             (dissoc queues key)))
+         queues)))
+    @discarded))
+
+(defn- submission-worker-loop!
+  [dispatcher process!]
+  (loop []
+    (when-let [key (async/<!! (:ready-ch dispatcher))]
+      (when-let [submission (take-next-submission! dispatcher key)]
+        (try
+          (process! submission)
+          (catch Throwable t
+            (safe-event! (:callbacks submission)
+                         {:type :codex-agent/submitted-message-failed
+                          :message (:message submission)
+                          :throwable t})))
+        (complete-submission! dispatcher key))
+      (recur))))
+
+(defn- start-submission-dispatcher!
+  [process! worker-count]
+  (let [ready-ch (async/chan)
+        !queues (atom {})
+        !closed? (atom false)
+        dispatcher-promise (promise)
+        worker-futures (mapv (fn [_]
+                               (future
+                                 (submission-worker-loop! @dispatcher-promise process!)))
+                             (range worker-count))
+        dispatcher (->SubmissionDispatcher ready-ch worker-futures !queues !closed?)]
+    (deliver dispatcher-promise dispatcher)
+    dispatcher))
+
+(defn- close-submission-dispatcher!
+  [^SubmissionDispatcher dispatcher timeout-ms]
+  (reset! (:!closed? dispatcher) true)
+  (reset! (:!queues dispatcher) {})
+  (async/close! (:ready-ch dispatcher))
+  (doseq [worker (:worker-futures dispatcher)]
+    (deref worker timeout-ms nil))
+  nil)
+
+(defn- submit-worker-count
+  [config]
+  (max 1 (long (or (:submit-worker-count config)
+                   default-submit-worker-count))))
+
+(defn- submit-close-timeout-ms
+  [config]
+  (long (or (:submit-close-timeout-ms config)
+            default-submit-close-timeout-ms)))
 
 (defn- app-server-service
   [config]
@@ -21,10 +185,17 @@
                (store-edn/open! {:path store-path})
                app-service
                owned?
-               (atom {}))))
+               (atom {})
+               (atom nil)
+               (atom false))))
 
 (defn close!
   [^Service service]
+  (reset! (:closed?* service) true)
+  (when-let [dispatcher @(:dispatcher* service)]
+    (close-submission-dispatcher! dispatcher
+                                  (submit-close-timeout-ms (:config service)))
+    (reset! (:dispatcher* service) nil))
   (when (:owns-app-server? service)
     (app-server/close! (:app-server service)))
   nil)
@@ -174,18 +345,23 @@
         requested-key (session/session-key message)
         key (store-edn/canonical-session-key store requested-key)
         stored-session (store-edn/get-session store key)
+        discarded-count (if-let [dispatcher @(:dispatcher* service)]
+                          (discard-pending-submissions! dispatcher key)
+                          0)
         interrupt-result (app-server/interrupt-turn!
                           (:app-server service)
                           {:session-key (app-session-key key)})
         codex-thread-id (or (:codex-thread-id interrupt-result)
                             (:codex-thread-id stored-session))]
-    (merge
-     (result-base {:channel (first key)
-                   :external-session-id (second key)}
-                  codex-thread-id)
-     {:status (if (:interrupted? interrupt-result) :interrupted :idle)
-      :interrupted? (boolean (:interrupted? interrupt-result))}
-     (select-keys interrupt-result [:reason :error-message :codex-turn-id]))))
+    (cond-> (merge
+             (result-base {:channel (first key)
+                           :external-session-id (second key)}
+                          codex-thread-id)
+             {:status (if (:interrupted? interrupt-result) :interrupted :idle)
+              :interrupted? (boolean (:interrupted? interrupt-result))}
+             (select-keys interrupt-result [:reason :error-message :codex-turn-id]))
+      (pos? discarded-count)
+      (assoc :discarded-message-count discarded-count))))
 
 (defn handle-message!
   [^Service service message callbacks]
@@ -290,3 +466,51 @@
           (throw t))
         (finally
           (.unlock lock))))))
+
+(defn- process-submission!
+  [service {:keys [message callbacks]}]
+  (handle-message! service message callbacks))
+
+(defn- ensure-submission-dispatcher!
+  [^Service service]
+  (when @(:closed?* service)
+    (throw (ex-info "Codex Agent service is closed"
+                    {:type :codex-agent/service-closed})))
+  (or @(:dispatcher* service)
+      (let [dispatcher (start-submission-dispatcher!
+                        #(process-submission! service %)
+                        (submit-worker-count (:config service)))
+            installed (swap! (:dispatcher* service)
+                             (fn [current]
+                               (or current dispatcher)))]
+        (when-not (identical? installed dispatcher)
+          (close-submission-dispatcher! dispatcher 0))
+        installed)))
+
+(defn submit-message!
+  "Queue a message for asynchronous per-session FIFO handling.
+
+   This is the non-blocking adapter entrypoint. It keeps ordinary messages for
+   one external session ordered while allowing different sessions to run in
+   parallel. The queue is in-memory and is discarded when the service closes."
+  [^Service service message callbacks]
+  (let [store (:store service)
+        key (store-edn/canonical-session-key store (session/session-key message))
+        existing (store-edn/get-session store key)]
+    (cond
+      @(:closed?* service)
+      {:status :closed
+       :channel (first key)
+       :external-session-id (second key)}
+
+      (session/processed-message? existing (:external-message-id message))
+      (assoc (result-base {:channel (first key)
+                           :external-session-id (second key)}
+                          (:codex-thread-id existing))
+             :status :duplicate)
+
+      :else
+      (enqueue-submission! (ensure-submission-dispatcher! service)
+                           key
+                           message
+                           callbacks))))

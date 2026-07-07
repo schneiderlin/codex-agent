@@ -13,6 +13,10 @@
   [svc message callbacks]
   (service/handle-message! svc message callbacks))
 
+(defn submit-message!
+  [svc message callbacks]
+  (service/submit-message! svc message callbacks))
+
 (defn promote-session!
   [svc request]
   (service/promote-session! svc request))
